@@ -422,14 +422,14 @@ class NixlBaseConnectorWorker:
         )
 
         self.kv_cache_config = kv_cache_config
-        attention_block_sizes = [
+        transfer_block_sizes = [
             group.kv_cache_spec.block_size
             for group in kv_cache_config.transfer_groups
             if not isinstance(group.kv_cache_spec, MambaSpec)
         ]
         self.block_size = (
-            math.lcm(*attention_block_sizes)
-            if attention_block_sizes
+            math.lcm(*transfer_block_sizes)
+            if transfer_block_sizes
             else cast(int, vllm_config.cache_config.block_size)
         )
         # Per-layer specs, unwrapping UniformTypeKVCacheSpecs group wrappers.
@@ -674,13 +674,8 @@ class NixlBaseConnectorWorker:
         # Uses Queue for thread-safe cross-thread coordination with the
         # background handshake thread, matching the _ready_requests pattern.
         self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
-        self._invalidated_recv_reqs: queue.Queue[ReqId] = queue.Queue()
         self._pending_recv_notifs: dict[ReqId, list[tuple[str, bytes]]] = {}
-        # A posted READ cannot be aborted, so failure remains pending until
-        # every sibling transfer is terminal and its blocks are safe to reuse.
         self._failed_recv_pending: set[ReqId] = set()
-        self._failed_recv_reported: set[ReqId] = set()
-        self._failed_recv_lock = threading.Lock()
 
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
@@ -1572,7 +1567,7 @@ class NixlBaseConnectorWorker:
                 "models without Mamba layers."
             )
         for mem_type in sorted(set(region_mem_types)):
-            typed = [
+            ranges_for_mem_type = [
                 (start, end - start, device_id, "")
                 for (_, cache_mem_type), (
                     start,
@@ -1581,7 +1576,7 @@ class NixlBaseConnectorWorker:
                 ) in registration_ranges.items()
                 if cache_mem_type == mem_type
             ]
-            descs = self.nixl_wrapper.get_reg_descs(typed, mem_type)
+            descs = self.nixl_wrapper.get_reg_descs(ranges_for_mem_type, mem_type)
             self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
             self._registered_descs.append(descs)
 
@@ -2607,24 +2602,9 @@ class NixlBaseConnectorWorker:
             except queue.Empty:
                 break
 
-        invalidated_recv_reqs = set[ReqId]()
-        while not self._invalidated_recv_reqs.empty():
-            try:
-                invalidated_recv_reqs.add(self._invalidated_recv_reqs.get_nowait())
-            except queue.Empty:
-                break
-
-        # Drained: a later request reusing the same id (abort + resubmit) is
-        # a distinct lifecycle and may fail again.
-        with self._failed_recv_lock:
-            self._failed_recv_reported.difference_update(
-                failed_recv_reqs | invalidated_recv_reqs
-            )
-
         # Add failed requests to done_recving for scheduler tracking
         # (blocks are already marked invalid, scheduler will handle recompute)
         done_recving.update(failed_recv_reqs)
-        done_recving.update(invalidated_recv_reqs)
         if len(done_sending) > 0 or len(done_recving) > 0:
             logger.debug(
                 "Rank %s, get_finished: %s requests done sending "
@@ -2638,18 +2618,13 @@ class NixlBaseConnectorWorker:
         block_ids_for_blocksize_post_process = defaultdict(list)
         block_ids_for_heterogeneous_attn_post_process = list[list[int]]()
         direct_device_recving = set[str]()
-        for req_id in tuple(done_recving):
+        for req_id in done_recving:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
-            if meta is None:
-                logger.debug(
-                    "Skipping late duplicate completion for request %s", req_id
-                )
-                done_recving.discard(req_id)
-                continue
+            assert meta is not None, f"{req_id} not found in recving_metadata list"
 
             # Skip KV sync and post-processing for failed requests
-            if req_id in failed_recv_reqs or req_id in invalidated_recv_reqs:
+            if req_id in failed_recv_reqs:
                 logger.warning(
                     "Skipping KV post-processing for failed request %s",
                     req_id,
@@ -2793,6 +2768,7 @@ class NixlBaseConnectorWorker:
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = []
+            failed = req_id in self._failed_recv_pending
             for handle in handles:
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
@@ -2815,9 +2791,7 @@ class NixlBaseConnectorWorker:
                         with contextlib.suppress(Exception):
                             self.nixl_wrapper.release_xfer_handle(handle)
                         self.xfer_stats.record_failed_transfer()
-                        if is_recv:
-                            with self._failed_recv_lock:
-                                self._failed_recv_pending.add(req_id)
+                        failed = True
                 except Exception as e:
                     self._log_failure(
                         failure_type="transfer_exception",
@@ -2828,23 +2802,20 @@ class NixlBaseConnectorWorker:
                     self.xfer_stats.record_failed_transfer()
                     with contextlib.suppress(Exception):
                         self.nixl_wrapper.release_xfer_handle(handle)
-                    if is_recv:
-                        with self._failed_recv_lock:
-                            self._failed_recv_pending.add(req_id)
+                    failed = True
 
             if in_progress:
                 transfers[req_id] = in_progress
+                if is_recv and failed:
+                    self._failed_recv_pending.add(req_id)
                 continue
             del transfers[req_id]
-            if is_recv:
-                with self._failed_recv_lock:
-                    failed = req_id in self._failed_recv_pending
-                    self._failed_recv_pending.discard(req_id)
-                if failed:
-                    self._report_failed_recv(req_id)
-                    continue
-                if req_id not in self._recving_metadata:
-                    continue
+            if is_recv and failed:
+                self._failed_recv_pending.discard(req_id)
+                self._report_failed_recv(req_id)
+                continue
+            if is_recv and req_id not in self._recving_metadata:
+                continue
             done_req_ids.add(req_id)
             if is_recv:
                 self._send_pending_recv_notifs(req_id)
@@ -2867,37 +2838,26 @@ class NixlBaseConnectorWorker:
                 self.xfer_stats.record_failed_notification()
 
     def _handle_failed_transfer(self, req_id: str, handle: int | None):
-        """Defer failure reporting while sibling transfers remain in flight."""
+        """Report a failure after every transfer for the request is terminal."""
         if handle is not None:
             with contextlib.suppress(Exception):
                 self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
-        with self._failed_recv_lock:
-            if self._recving_transfers.get(req_id):
-                self._failed_recv_pending.add(req_id)
-                return
-            self._failed_recv_pending.discard(req_id)
+        if self._recving_transfers.get(req_id):
+            self._failed_recv_pending.add(req_id)
+            return
         self._report_failed_recv(req_id)
 
     def _report_failed_recv(self, req_id: str) -> None:
-        """Report a failed recv exactly once and invalidate its blocks."""
-        with self._failed_recv_lock:
-            if (
-                req_id not in self._recving_metadata
-                or req_id in self._failed_recv_reported
-            ):
-                self._pending_recv_notifs.pop(req_id, None)
-                return
-            self._failed_recv_reported.add(req_id)
-        # Use .get() here; transfer-result collection owns metadata cleanup.
-        if self._is_hma_required:
-            self._failed_recv_reqs.put(req_id)
-        else:
-            if meta := self._recving_metadata.get(req_id):
-                self._invalid_block_ids.put(
-                    {block_id for group in meta.local_block_ids for block_id in group}
-                )
-            self._invalidated_recv_reqs.put(req_id)
+        meta = self._recving_metadata.get(req_id)
+        if meta is None:
+            self._pending_recv_notifs.pop(req_id, None)
+            return
+        if not self._is_hma_required:
+            self._invalid_block_ids.put(
+                {block_id for group in meta.local_block_ids for block_id in group}
+            )
+        self._failed_recv_reqs.put(req_id)
         self._pending_recv_notifs.pop(req_id, None)
 
     def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> None:
