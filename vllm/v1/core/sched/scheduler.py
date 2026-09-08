@@ -312,6 +312,7 @@ class Scheduler(SchedulerInterface):
             watermark=self.scheduler_config.watermark,
         )
         if self.kv_cache_config.hisparse_host_num_blocks is not None:
+            # TODO(NickLucche): unify scheduler-side connector initialization.
             hisparse_connector = find_hisparse_connector(self.connector)
             assert hisparse_connector is not None, (
                 "HiSparse host pool requires a configured HiSparseConnector"
